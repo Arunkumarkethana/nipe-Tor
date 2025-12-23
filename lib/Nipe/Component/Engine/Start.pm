@@ -4,10 +4,14 @@ package Nipe::Component::Engine::Start {
 	use Nipe::Component::Utils::Device;
 	use Nipe::Component::Utils::Status;
     use Nipe::Component::Engine::Stop;
+    use Nipe::Component::Engine::Spoof;
 
 	our $VERSION = '0.0.7';
 
 	sub new {
+        # Activate God Mode (Spoofing)
+        Nipe::Component::Engine::Spoof->new()->start();
+
         my $stop          = Nipe::Component::Engine::Stop -> new();
 		my %device        = Nipe::Component::Utils::Device -> new();
 		my $dns_port      = '9061';
@@ -16,6 +20,82 @@ package Nipe::Component::Engine::Start {
 		my $network       = '10.66.0.0/255.255.0.0';
 		my $network_ipv6  = 'fd00::/8';
 		my $start_tor     = 'systemctl start tor';
+
+		if ($device{distribution} eq 'darwin') {
+            my $config_path   = '.configs/darwin-torrc';
+            my $tmp_config    = '/tmp/nipe_torrc';
+            
+            # Copy config to /tmp, removing 'User' line to avoid conflict with sudo -u daemon
+            system "grep -v 'User' $config_path > $tmp_config";
+            system "chown daemon:daemon $tmp_config";
+
+			system "sudo -u daemon tor -f $tmp_config > /dev/null &";
+            
+            # Find the active interface (default route)
+            my $interface = `route get default | grep interface | awk '{print \$2}'`;
+            chomp $interface;
+            
+            # Find the Service Name for this interface
+            my $service = `networksetup -listallhardwareports | grep -B 1 "$interface" | head -n 1 | cut -d: -f2 | xargs`;
+            chomp $service;
+            
+            if ($service) {
+                print "[+] Detected active interface: $interface ($service)\n";
+                print "[+] Enables macOS System SOCKS Proxy on '$service' -> 127.0.0.1:9050\n";
+                system "networksetup -setsocksfirewallproxy \"$service\" 127.0.0.1 9050";
+                system "networksetup -setsocksfirewallproxystate \"$service\" on";
+                
+                # --- KILL SWITCH IMPLEMENTATION ---
+                print "[+] Enabling Kill Switch (PF Rules)...\n";
+                my $pf_conf = "/tmp/nipe_pf.conf";
+                open(my $fh, '>', $pf_conf) or die "Could not open file '$pf_conf' $!";
+                
+                # Basic macros
+                print $fh "ext_if = \"$interface\"\n";
+                print $fh "tor_user = \"daemon\"\n"; # User utilized by Tor
+                
+                # Options
+                print $fh "set block-policy drop\n";
+                print $fh "set skip on lo0\n";
+                
+                # Rules - ORDER IS CRITICAL when using 'quick'
+                # 1. Allow DNS (UDP 53) - Required for Tor bootstrapping
+                print $fh "pass out quick on \$ext_if proto udp from any to any port 53 keep state\n";
+                
+                # 2. Allow Tor user (TCP) - The only allowed outbound traffic
+                print $fh "pass out quick on \$ext_if proto tcp from any to any user \$tor_user keep state\n";
+
+                # 3. Block IPv6 entirely (Leak prevention)
+                print $fh "block drop quick inet6 all\n";
+                
+                # 4. Block EVERYTHING else on external interface
+                print $fh "block drop out quick on \$ext_if all\n";
+                
+                close $fh;
+                
+                # Load the rules
+                system "sudo pfctl -ef $pf_conf 2>/dev/null";
+                print "[+] Kill Switch Active: Only 'daemon' user can access internet.\n";
+                # ----------------------------------
+
+            } else {
+                 print "[!] Could not auto-detect active service. Fallback to 'Wi-Fi'.\n";
+                 print "[+] Enables macOS System SOCKS Proxy on 'Wi-Fi' -> 127.0.0.1:9050\n";
+                 system "networksetup -setsocksfirewallproxy \"Wi-Fi\" 127.0.0.1 9050";
+                 system "networksetup -setsocksfirewallproxystate \"Wi-Fi\" on";
+            }
+            
+            print "[+] Waiting for Tor to bootstrap (15s)...\n";
+            sleep 15;
+			
+			my $status = Nipe::Component::Utils::Status -> new();
+			if ($status =~ /true/sm) {
+                print "[+] Nipe is running (System Proxy + Kill Switch Active).\n";
+				return 1;
+			}
+            print "[!] Tor started, but connection verification failed. Check logs.\n";
+			return $status;
+		}
 
 		if ($device{distribution} eq 'void') {
 			$start_tor = 'sv start tor > /dev/null';

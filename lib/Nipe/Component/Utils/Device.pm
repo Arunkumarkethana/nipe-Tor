@@ -6,6 +6,15 @@ package Nipe::Component::Utils::Device {
 	our $VERSION = '0.0.4';
 
 	sub new {
+		# macOS (Darwin) check first to avoid reading /etc/os-release
+		if ($^O eq 'darwin') {
+			my %device = (
+				'username'     => $ENV{SUDO_USER} || $ENV{USER},
+				'distribution' => 'darwin'
+			);
+			return %device;
+		}
+
 		my $config    = Config::Simple -> new('/etc/os-release');
 		my $id_like   = $config -> param('ID_LIKE') || q{};
 		my $id_distro = $config -> param('ID');
